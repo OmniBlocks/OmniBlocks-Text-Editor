@@ -3,6 +3,7 @@ import recordIcon from "./record.svg";
 
 export default async ({ addon, console, msg }) => {
   let recordElem;
+  let recordTextSpan;
   let isRecording = false;
   let isWaitingForFlag = false;
   let waitingForFlagFunc = null;
@@ -11,23 +12,76 @@ export default async ({ addon, console, msg }) => {
   let recordBuffer = [];
   let recorder;
   let timeout;
+  let ffmpeg = null;
 
-  const mimeType = [
-    // Chrome and Firefox only support encoding as webm
-    // VP9 is preferred as its playback is better supported across platforms
+  // Determine supported formats
+  const supportedMimeTypes = [
     "video/webm; codecs=vp9",
-    // Firefox only supports encoding VP8
     "video/webm",
-    // Safari only supports encoding H264 as mp4
     "video/mp4",
-  ].find((i) => MediaRecorder.isTypeSupported(i));
-  const fileExtension = mimeType.split(";")[0].split("/")[1];
+  ].filter((i) => MediaRecorder.isTypeSupported(i));
+  
+  const defaultMimeType = supportedMimeTypes[0];
+  const defaultFileExtension = defaultMimeType.split(";")[0].split("/")[1];
+  
+  // Available formats for dropdown
+  const availableFormats = [];
+  if (supportedMimeTypes.some(m => m.startsWith("video/webm"))) {
+    availableFormats.push("webm");
+  }
+  if (supportedMimeTypes.some(m => m.startsWith("video/mp4"))) {
+    availableFormats.push("mp4");
+  }
+
+  // Load FFmpeg.wasm only when needed
+  // Load FFmpeg.wasm v0.12.x (matches package.json)
+// Load FFmpeg.wasm v0.12.x (matches package.json)
+const loadFFmpeg = async () => {
+  if (ffmpeg) return ffmpeg;
+  
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    // Use v0.12.10 which has stable libx264 support
+    script.src = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.min.js";
+    script.onload = async () => {
+      try {
+        const { FFmpeg } = window.FFmpeg || {};
+        if (!FFmpeg) {
+          throw new Error("FFmpeg UMD bundle not found on window.FFmpeg");
+        }
+        ffmpeg = new FFmpeg();
+        
+        // Set up logging
+        ffmpeg.on('log', ({ message }) => {
+          console.log('FFmpeg:', message);
+        });
+        
+        // Load with multi-threaded core
+        await ffmpeg.load({
+          coreURL: "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm/ffmpeg-core.js",
+          wasmURL: "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm/ffmpeg-core.wasm",
+          workerURL: "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm/ffmpeg-core.worker.js"
+        });
+        
+        console.log('FFmpeg v0.12 loaded successfully');
+        resolve(ffmpeg);
+      } catch (error) {
+        console.error('FFmpeg load error:', error);
+        ffmpeg = null;
+        reject(error);
+      }
+    };
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+};
 
   while (true) {
     const elem = await addon.tab.waitForElement('div[class*="menu-bar_file-group"] > div:last-child:not(.sa-record)', {
       markAsSeen: true,
       reduxEvents: ["scratch-gui/mode/SET_PLAYER", "fontsLoaded/SET_FONTS_LOADED", "scratch-gui/locales/SELECT_LOCALE"],
     });
+    
     const getOptions = () => {
       const { backdrop, container, content, closeButton, remove } = addon.tab.createModal(msg("option-title"), {
         isOpen: true,
@@ -39,11 +93,33 @@ export default async ({ addon, console, msg }) => {
       content.appendChild(
         Object.assign(document.createElement("p"), {
           textContent: msg("record-description", {
-            extension: `.${fileExtension}`,
+            extension: `.${defaultFileExtension}`,
           }),
           className: "recordOptionDescription",
         })
       );
+
+      // Format selection dropdown
+      if (availableFormats.length > 1) {
+        const recordOptionFormat = document.createElement("p");
+        const recordOptionFormatLabel = Object.assign(document.createElement("label"), {
+          htmlFor: "recordOptionFormatInput",
+          textContent: msg("format"),
+        });
+        const recordOptionFormatInput = Object.assign(document.createElement("select"), {
+          id: "recordOptionFormatInput",
+        });
+        availableFormats.forEach(format => {
+          const option = document.createElement("option");
+          option.value = format;
+          option.textContent = format.toUpperCase();
+          if (format === defaultFileExtension) option.selected = true;
+          recordOptionFormatInput.appendChild(option);
+        });
+        recordOptionFormat.appendChild(recordOptionFormatLabel);
+        recordOptionFormat.appendChild(recordOptionFormatInput);
+        content.appendChild(recordOptionFormat);
+      }
 
       // Seconds
       const recordOptionSeconds = document.createElement("p");
@@ -116,7 +192,7 @@ export default async ({ addon, console, msg }) => {
       recordOptionMic.appendChild(recordOptionMicLabel);
       content.appendChild(recordOptionMic);
 
-      // Green flag
+      // Green flag    
       const recordOptionFlag = Object.assign(document.createElement("p"), {
         className: "mediaRecorderPopupOption",
       });
@@ -194,6 +270,7 @@ export default async ({ addon, console, msg }) => {
             micEnabled: recordOptionMicInput.checked,
             waitUntilFlag: recordOptionFlagInput.checked,
             useStopSign: !recordOptionStopInput.disabled && recordOptionStopInput.checked,
+            format: availableFormats.length > 1 ? recordOptionFormatInput.value : defaultFileExtension,
           }),
         { once: true }
       );
@@ -202,9 +279,10 @@ export default async ({ addon, console, msg }) => {
 
       return optionPromise;
     };
+    
     const disposeRecorder = () => {
       isRecording = false;
-      recordElem.textContent = msg("record");
+      recordTextSpan.textContent = msg("record");
       recordElem.title = "";
       recorder = null;
       recordBuffer = [];
@@ -215,7 +293,97 @@ export default async ({ addon, console, msg }) => {
         stopSignFunc = null;
       }
     };
-    const stopRecording = (force) => {
+    // Helper function to detect frame rate from video
+const detectFrameRate = async (ffmpeg, inputName) => {
+  try {
+    let probeOutput = '';
+    const logHandler = ({ message }) => {
+      probeOutput += message + '\n';
+    };
+    
+    ffmpeg.on('log', logHandler);
+    
+    try {
+      await ffmpeg.exec(['-i', inputName, '-hide_banner']);
+    } catch (e) {
+      // ffmpeg exits with error code when no output specified
+    }
+    
+    ffmpeg.off('log', logHandler);
+    
+    // Parse fps
+    const fpsMatch = probeOutput.match(/(\d+(?:\.\d+)?)\s*fps/i);
+    if (fpsMatch) {
+      const fps = parseFloat(fpsMatch[1]);
+      console.log(`Detected frame rate: ${fps} fps`);
+      return fps;
+    }
+    
+    const rateMatch = probeOutput.match(/(\d+)\/(\d+)\s*fps/);
+    if (rateMatch) {
+      const fps = parseInt(rateMatch[1]) / parseInt(rateMatch[2]);
+      console.log(`Detected frame rate: ${fps} fps`);
+      return fps;
+    }
+  } catch (error) {
+    console.warn('FPS detection failed:', error);
+  }
+  return null;
+};
+
+const convertWebmToMp4 = async (webmBlob) => {
+  try {
+    console.log('=== Starting conversion ===');
+    console.log('Input size:', webmBlob.size, 'bytes');
+    
+    const ffmpeg = await loadFFmpeg();
+    const inputName = 'input.webm';
+    const outputName = 'output.mp4';
+    
+    // Write input file using v0.12 API
+    const arrayBuffer = await webmBlob.arrayBuffer();
+    await ffmpeg.writeFile(inputName, new Uint8Array(arrayBuffer));
+    console.log('Input file written');
+    
+    // Detect FPS
+    const detectedFps = await detectFrameRate(ffmpeg, inputName);
+    const fps = detectedFps || 30;
+    console.log(`Using ${fps} fps`);
+    
+    // Convert with H.264 encoding
+    console.log('Starting ffmpeg encoding...');
+    await ffmpeg.exec([
+      '-i', inputName,
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      '-r', fps.toString(),
+      '-g', '30',
+      '-movflags', '+faststart',
+      '-c:a', 'aac', '-b:a', '128k',
+      outputName
+    ]);
+    console.log('Encoding complete');
+    
+    // Read output using v0.12 API
+    const data = await ffmpeg.readFile(outputName);
+    console.log('Output size:', data.length, 'bytes');
+    
+    // Clean up
+    await ffmpeg.deleteFile(inputName);
+    await ffmpeg.deleteFile(outputName);
+    
+    const outputBlob = new Blob([data.buffer], { type: 'video/mp4' });
+    console.log('=== Conversion successful ===');
+    return outputBlob;
+  } catch (error) {
+    console.error('=== Conversion FAILED ===');
+    console.error(error);
+    throw error;
+  }
+};
+    const stopRecording = async (force, selectedFormat) => {
       if (isWaitingForFlag) {
         addon.tab.traps.vm.runtime.off("PROJECT_START", waitingForFlagFunc);
         isWaitingForFlag = false;
@@ -226,17 +394,35 @@ export default async ({ addon, console, msg }) => {
         return;
       }
       if (!isRecording || !recorder || recorder.state === "inactive") return;
+      
       if (force) {
         disposeRecorder();
       } else {
-        recorder.onstop = () => {
-          const blob = new Blob(recordBuffer, { type: mimeType });
-          downloadBlob(`${addon.tab.redux.state?.preview?.projectInfo?.title || "video"}.${fileExtension}`, blob);
+        recorder.onstop = async () => {
+          let blob = new Blob(recordBuffer, { type: recorder.mimeType });
+          let finalExtension = recorder.mimeType.split(";")[0].split("/")[1];
+          
+          // Convert to MP4 if requested and not native
+          if (selectedFormat === "mp4" && !recorder.mimeType.includes("mp4")) {
+            try {
+              recordTextSpan.textContent = msg("converting");
+              blob = await convertWebmToMp4(blob);
+              finalExtension = "mp4";
+            } catch (e) {
+              console.error("WebM to MP4 conversion failed", e);
+              alert(msg("conversion-failed"));
+              // Fall back to original format
+              finalExtension = recorder.mimeType.split(";")[0].split("/")[1];
+            }
+          }
+          
+          downloadBlob(`${addon.tab.redux.state?.preview?.projectInfo?.title || "video"}.${finalExtension}`, blob);
           disposeRecorder();
         };
         recorder.stop();
       }
     };
+    
     const startRecording = async (opts) => {
       // Timer
       const secs = Math.min(600, Math.max(1, opts.secs));
@@ -257,10 +443,8 @@ export default async ({ addon, console, msg }) => {
       }
       if (opts.waitUntilFlag) {
         isWaitingForFlag = true;
-        Object.assign(recordElem, {
-          textContent: msg("click-flag"),
-          title: msg("click-flag-description"),
-        });
+        recordTextSpan.textContent = msg("click-flag");
+        recordElem.title = msg("click-flag-description");
         abortController = new AbortController();
         try {
           await Promise.race([
@@ -298,7 +482,27 @@ export default async ({ addon, console, msg }) => {
       if (opts.audioEnabled || opts.micEnabled) {
         stream.addTrack(dest.stream.getAudioTracks()[0]);
       }
-      recorder = new MediaRecorder(stream, { mimeType });
+      
+// Determine recording format
+const selectedFormat = opts.format || defaultFileExtension;
+let recordMimeType;
+
+if (selectedFormat === "mp4") {
+  // Try MP4 with specific codec support for audio
+  const mp4WithCodecs = "video/mp4; codecs=avc1,mp4a.40.2";
+  if (MediaRecorder.isTypeSupported(mp4WithCodecs)) {
+    recordMimeType = mp4WithCodecs;
+  } else if (MediaRecorder.isTypeSupported("video/mp4")) {
+    recordMimeType = "video/mp4";
+  } else {
+    // Fall back to WebM if MP4 not supported
+    recordMimeType = supportedMimeTypes.find(m => m.startsWith("video/webm")) || defaultMimeType;
+  }
+} else {
+  recordMimeType = supportedMimeTypes.find(m => m.startsWith("video/webm")) || defaultMimeType;
+}
+      
+      recorder = new MediaRecorder(stream, { mimeType: recordMimeType });
       recorder.ondataavailable = (e) => {
         recordBuffer.push(e.data);
       };
@@ -306,9 +510,9 @@ export default async ({ addon, console, msg }) => {
         console.warn("Recorder error:", e.error);
         stopRecording(true);
       };
-      timeout = setTimeout(() => stopRecording(false), secs * 1000);
+      timeout = setTimeout(() => stopRecording(false, selectedFormat), secs * 1000);
       if (opts.useStopSign) {
-        stopSignFunc = () => stopRecording();
+        stopSignFunc = () => stopRecording(false, selectedFormat);
         vm.runtime.once("PROJECT_STOP_ALL", stopSignFunc);
       }
 
@@ -316,44 +520,47 @@ export default async ({ addon, console, msg }) => {
       const delay = opts.delay || 0;
       const roundedDelay = Math.floor(delay);
       for (let index = 0; index < roundedDelay; index++) {
-        recordElem.textContent = msg("starting-in", { secs: roundedDelay - index });
+        recordTextSpan.textContent = msg("starting-in", { secs: roundedDelay - index });
         await new Promise((resolve) => setTimeout(resolve, 975));
       }
       setTimeout(
         () => {
-          recordElem.textContent = msg("stop");
-
+          recordTextSpan.textContent = msg("stop");
           recorder.start(1000);
         },
         (delay - roundedDelay) * 1000
       );
     };
-if (!recordElem) {
-  recordElem = Object.assign(document.createElement("div"), {
-    className: "sa-record " + elem.className,
-  });
-  const icon = Object.assign(document.createElement("img"), {
-    src: recordIcon,
-    className: "sa-record-icon",
-  });
-  recordElem.appendChild(icon);
-  const text = Object.assign(document.createElement("span"), {
-    textContent: msg("record"),
-  });
-  recordElem.appendChild(text);
-  recordElem.addEventListener("click", async () => {
-    if (isRecording) {
-      stopRecording();
-    } else {
-      const opts = await getOptions();
-      if (!opts) {
-        console.log("Canceled");
-        return;
-      }
-      startRecording(opts);
+
+    if (!recordElem) {
+      recordElem = Object.assign(document.createElement("div"), {
+        className: "sa-record " + elem.className,
+      });
+      const icon = Object.assign(document.createElement("img"), {
+        src: recordIcon,
+        className: "sa-record-icon",
+      });
+      recordElem.appendChild(icon);
+      recordTextSpan = Object.assign(document.createElement("span"), {
+        textContent: msg("record"),
+      });
+      recordElem.appendChild(recordTextSpan);
+      recordElem.addEventListener("click", async () => {
+        if (isRecording) {
+          // Get selected format from options if available
+          const formatInput = document.getElementById("recordOptionFormatInput");
+          const selectedFormat = formatInput ? formatInput.value : defaultFileExtension;
+          stopRecording(false, selectedFormat);
+        } else {
+          const opts = await getOptions();
+          if (!opts) {
+            console.log("Canceled");
+            return;
+          }
+          startRecording(opts);
+        }
+      });
     }
-  });
-}
 
     elem.parentElement.appendChild(recordElem);
   }

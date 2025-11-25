@@ -12,29 +12,22 @@ import GUI from './render-gui.jsx';
 import render from './app-target';
 
 const getProjectId = () => {
-    if (window.location.pathname.includes('/embed')) {
-        const hashMatch = location.hash.match(/#(\d+)/);
-        if (hashMatch !== null) {
-            return hashMatch[1];
-        }
-        const pathMatch = location.pathname.match(/(\d+)\/embed/);if(pathMatch !== null){return pathMatch[pathMatch.length - 1];}}return null;}
-// ^^ amazing line of code, im not a monster
-const projectId = getProjectId();
-alert(`Project ID: ${projectId}`);
-let embedUrl;
-if (projectId != null) {
-    alert("Project id not null, trying to embed ${projectId}");  
-    embedUrl = `https://turbowarp.org/${projectId}/embed`;
-} else if (projectId == null) {
-    // im gonna name all my files con
-    console.warn('No project ID found: Embedding without a project.');
-    embedUrl = location.href; // locashionn hyper reference
-        if (!window.location.pathname.endsWith('/embed')) {
-        alert(`Embedding project from URL: ${window.location.pathname}`);
-        window.location.href = `${window.location.pathname}`;
+    // For compatibility reasons, we first look at the hash.
+    // eg. https://turbowarp.org/embed.html#1
+    const hashMatch = location.hash.match(/#(\d+)/);
+    if (hashMatch !== null) {
+        return hashMatch[1];
     }
-}
+    // Otherwise, we'll recreate what "wildcard" routing does.
+    // eg. https://turbowarp.org/1/embed
+    const pathMatch = location.pathname.match(/(\d+)\/embed/);
+    if (pathMatch !== null) {
+        return pathMatch[pathMatch.length - 1];
+    }
+    return '0';
+};
 
+const projectId = getProjectId();
 const urlParams = new URLSearchParams(location.search);
 
 let vm;
