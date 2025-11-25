@@ -4,6 +4,17 @@ This file is automatically updated by the Changelog Updater bot.
 
 <!-- UNRELEASED_COMMITS_START -->
 
+### Commit [`7f44afe`](https://github.com/OmniBlocks/OmniBlocks-Text-Editor/commit/7f44afe5cfbf025c26c66d717aa7da97f25fd847) - 2025-11-25 17:09:52 -0500
+
+**Merge pull request #2 from OmniBlocks/main**
+
+Update upstream 
+
+*Author: supervoidcoder*
+
+---
+
+
 ### Commit [`485af09`](https://github.com/OmniBlocks/scratch-gui/commit/485af0914190d3af2b2cd4e5c8c817833337cc03) - 2025-11-25 17:02:06 -0500
 
 **Update offline PWA guide with desktop app note & video**
